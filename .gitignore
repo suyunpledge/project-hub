@@ -1,0 +1,5 @@
+data/
+.scratch/
+__pycache__/
+*.pyc
+tools/__pycache__/
