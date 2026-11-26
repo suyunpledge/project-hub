@@ -19,7 +19,7 @@ import traceback
 from . import core, github, manage, search
 
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
-SERVER = {"name": "project-hub", "title": "Project Hub", "version": "1.1.1"}
+SERVER = {"name": "project-hub", "title": "Project Hub", "version": "1.1.2"}
 
 S = {"type": "string"}
 B = {"type": "boolean"}
