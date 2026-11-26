@@ -150,5 +150,22 @@ def main() -> None:
     print(f"完成：{out}  ({out.stat().st_size / 1048576:.1f} MB)\nSHA-256 {digest}")
 
 
+def _fail(message: str) -> None:
+    """Report a build failure; on GitHub Actions also as an annotation (readable without the logs)."""
+    print(message, file=sys.stderr)
+    if os.environ.get("GITHUB_ACTIONS"):
+        text = message.replace("%", "%25").replace(chr(13), "%0D").replace(chr(10), "%0A")
+        print(f"::error title=installer build::{text}", flush=True)
+    raise SystemExit(1)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            _fail(str(e.code))
+        raise
+    except Exception:
+        import traceback
+        _fail(traceback.format_exc()[-3000:])
