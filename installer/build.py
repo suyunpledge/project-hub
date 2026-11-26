@@ -156,7 +156,8 @@ def main() -> None:
     compile_cs(setup_src, out, target="winexe", icon=icon,
                resources=[(BUILD / "payload.zip", "payload.zip"), (ROOT / "hub" / "static" / "icon.png", "logo.png")])
     digest = hashlib.sha256(out.read_bytes()).hexdigest()
-    (DIST / f"{out.name}.sha256").write_text(f"{digest}  {out.name}\n", "utf-8")
+    # LF endings so `sha256sum -c` works too (write_text would produce CRLF on Windows)
+    (DIST / f"{out.name}.sha256").write_bytes(f"{digest}  {out.name}\n".encode())
     print(f"完成：{out}  ({out.stat().st_size / 1048576:.1f} MB)\nSHA-256 {digest}")
 
 
