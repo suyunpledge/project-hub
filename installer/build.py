@@ -72,10 +72,20 @@ def verify_signature(exe: Path) -> None:
     """The runtime's python.exe must carry a valid Python Software Foundation signature."""
     ps = (f"$s=Get-AuthenticodeSignature -LiteralPath '{exe}';"
           "Write-Output ($s.Status.ToString()+'|'+$s.SignerCertificate.Subject)")
-    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True).stdout.strip()
+    # Prefer PowerShell 7. Windows PowerShell started from pwsh (GitHub Actions) inherits pwsh's
+    # PSModulePath and then cannot load its own Microsoft.PowerShell.Security module — clear it.
+    shell = shutil.which("pwsh") or "powershell"
+    env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+    r = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace", env=env)
+    out = r.stdout.strip()
     status, _, subject = out.partition("|")
+    if not status:
+        # The check itself could not run. The archive already matched the pinned SHA-256 above,
+        # so the runtime is the genuine python.org build; report why instead of failing blindly.
+        sys.exit(f"{exe.name} 签名检查无法执行（{shell}）：{r.stderr.strip()[-800:] or '无输出'}")
     if status != "Valid" or "Python Software Foundation" not in subject:
-        sys.exit(f"{exe.name} 签名校验失败：{out}")
+        sys.exit(f"{exe.name} 签名无效：{out}")
     print(f"签名有效：{subject.split(',')[0]}")
 
 
