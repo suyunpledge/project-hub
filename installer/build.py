@@ -20,6 +20,11 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+# CI consoles (GitHub Actions on Windows) default to cp1252, which cannot print Chinese.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream and hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 CACHE = HERE / "cache"

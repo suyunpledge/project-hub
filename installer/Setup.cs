@@ -25,7 +25,7 @@ using Microsoft.Win32;
 
 static class Setup
 {
-    public const string Version = "1.1.0";
+    public const string Version = "1.1.1";
     public const string AppName = "Project Hub";
     const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\ProjectHub";
 
