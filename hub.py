@@ -127,6 +127,57 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("project")
     s.add_argument("field", choices=["run", "check", "preview", "description", "name"])
     s.add_argument("value")
+
+    # --- search & management
+    s = sp.add_parser("grep", help="跨项目搜索文件内容")
+    s.add_argument("pattern")
+    s.add_argument("projects", nargs="*", help="限定项目；省略则按 --group/--tag，再省略则全部")
+    s.add_argument("--group")
+    s.add_argument("--tag", action="append", default=[])
+    s.add_argument("--regex", action="store_true", help="按扩展正则匹配（默认按字面）")
+    s.add_argument("--case", action="store_true", help="区分大小写")
+    s.add_argument("--glob", action="append", default=[], help="文件通配，如 *.py，可重复")
+    s.add_argument("--max", type=int, default=50, help="每个项目最多显示的行数")
+    s = sp.add_parser("overview", help="所有项目的分支、改动、领先/落后与最近提交")
+    s.add_argument("--group")
+    s = sp.add_parser("pin", help="置顶项目")
+    s.add_argument("projects", nargs="+")
+    s = sp.add_parser("unpin", help="取消置顶")
+    s.add_argument("projects", nargs="+")
+    s = sp.add_parser("relocate", help="项目目录移动后更新登记路径")
+    s.add_argument("project")
+    s.add_argument("path")
+    s = sp.add_parser("prune", help="列出（--yes 则移除）目录已不存在的登记")
+    s.add_argument("--yes", action="store_true")
+
+    # --- GitHub & MCP
+    s = sp.add_parser("github", help="GitHub 授权、建仓与发布")
+    gs = s.add_subparsers(dest="gh", required=True)
+    gs.add_parser("status", help="授权状态")
+    g = gs.add_parser("connect", help="授权 GitHub（令牌从标准输入读取，或复用 Git 的登录）")
+    g.add_argument("--use-git-login", action="store_true", help="复用 Git Credential Manager 的 GitHub 登录")
+    g.add_argument("--no-create", action="store_true", help="不允许 Agent 新建仓库")
+    g.add_argument("--no-push", action="store_true", help="不允许 Agent 推送")
+    g.add_argument("--public", action="store_true", help="新建仓库默认公开（默认私有）")
+    gs.add_parser("disconnect", help="移除授权")
+    g = gs.add_parser("create-repo", help="新建空仓库")
+    g.add_argument("name")
+    g.add_argument("--public", action="store_true")
+    g.add_argument("--desc", default="")
+    g.add_argument("--org")
+    g = gs.add_parser("publish", help="为项目建仓（或接到已有仓库）并推送")
+    g.add_argument("project")
+    g.add_argument("--repo", help="仓库名，默认取项目名")
+    g.add_argument("--public", action="store_true")
+    g.add_argument("--desc")
+    g.add_argument("--org")
+    g.add_argument("--remote", default="origin")
+    g.add_argument("-b", "--branch")
+    g.add_argument("--existing", action="store_true", help="接到 GitHub 上已存在的同名仓库")
+    for sub in gs.choices.values():
+        sub.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    sp.add_parser("mcp", help="以 MCP 服务器运行（stdio），供 Agent 调用")
+    sp.add_parser("mcp-config", help="打印在 Claude Code / Codex 中注册 MCP 的配置")
     # Keep the documented trailing flag and preserve a global --json before the command.
     for command in sp.choices.values():
         command.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
@@ -257,6 +308,83 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "set":
             p = core.update_project(core.find_project(a.project)["id"], {a.field: a.value})
             out(p, j, f"{p['id']}.{a.field} = {a.value}")
+        elif a.cmd == "grep":
+            from hub import search
+            r = search.grep(a.pattern, a.projects or None, a.group, a.tag, a.regex, not a.case, a.glob, a.max)
+            lines = [f"{r['total']} 处匹配，{r['matched']}/{r['projects']} 个项目，用时 {r['seconds']}s"]
+            for res in r["results"]:
+                lines.append(f"\n[{res['id']}] {res['path']}" + (f"  错误：{res['error']}" if res.get("error") else ""))
+                lines += [f"  {h['file']}:{h['line']}: {h['text']}" for h in res["hits"]]
+                if res["truncated"]:
+                    lines.append("  …（已截断，用 --max 调大）")
+            out(r, j, "\n".join(lines))
+        elif a.cmd == "overview":
+            from hub import manage
+            r = manage.overview(a.group)
+            sm = r["summary"]
+            rows = [f"{sm['projects']} 个项目：{sm['dirty']} 个有未提交改动，{sm['ahead']} 个待推送，"
+                    f"{sm['behind']} 个落后上游，{sm['missing']} 个目录失效，{sm['noRemote']} 个无远端"]
+            for p in r["projects"]:
+                if not p["exists"]:
+                    state = "目录不存在"
+                elif not p["git"]:
+                    state = "非 git"
+                else:
+                    state = (f"{p['branch']}" + (f" ✎{p['changes']}" if p["changes"] else "")
+                             + (f" ↑{p['ahead']}" if p["ahead"] else "") + (f" ↓{p['behind']}" if p["behind"] else ""))
+                rows.append(f"{'★' if p['pinned'] else ' '} {p['id']:<24} {state}")
+            out(r, j, "\n".join(rows))
+        elif a.cmd in ("pin", "unpin"):
+            from hub import manage
+            ids = manage.set_pinned(a.projects, a.cmd == "pin")
+            out({"projects": ids, "pinned": a.cmd == "pin"}, j, ("已置顶：" if a.cmd == "pin" else "已取消置顶：") + "、".join(ids))
+        elif a.cmd == "relocate":
+            from hub import manage
+            p = manage.relocate(a.project, a.path)
+            out(p, j, f"{p['id']} → {p['path']}")
+        elif a.cmd == "prune":
+            from hub import manage
+            r = manage.prune(dry_run=not a.yes)
+            text = ("已移除：" + "、".join(r["removed"])) if a.yes else \
+                ("\n".join(f"  {m['id']}  {m['path']}" for m in r["missing"]) + "\n加 --yes 移除以上登记") if r["missing"] \
+                else "没有失效的登记"
+            out(r, j, text if r["removed"] or r["missing"] or not a.yes else "没有失效的登记")
+        elif a.cmd == "github":
+            from hub import github
+            if a.gh == "status":
+                r = github.status()
+                text = ("未连接 GitHub" if not r["connected"] else
+                        f"已连接：{r.get('login')}（{r['mode']}）{'' if r.get('ok', True) else '  ⚠ ' + r.get('error', '')}\n"
+                        f"Agent 权限：建仓 {'✓' if r['grants']['createRepo'] else '✗'}  推送 {'✓' if r['grants']['push'] else '✗'}"
+                        f"  新仓库默认{'私有' if r['defaultPrivate'] else '公开'}")
+                out(r, j, text)
+            elif a.gh == "connect":
+                grants = {"createRepo": not a.no_create, "push": not a.no_push}
+                if a.use_git_login:
+                    r = github.connect("git-credential", grants=grants, default_private=not a.public)
+                else:
+                    import getpass
+                    tok = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass("GitHub 令牌：")
+                    r = github.connect("token", tok, grants, not a.public)
+                out(r, j, f"已连接 GitHub：{r.get('login')}")
+            elif a.gh == "disconnect":
+                github.disconnect()
+                out({"ok": True}, j, "已移除 GitHub 授权")
+            elif a.gh == "create-repo":
+                r = github.create_repo(a.name, False if a.public else None, a.desc, a.org)
+                out(r, j, f"已创建 {r['fullName']}：{r['url']}")
+            elif a.gh == "publish":
+                r = github.publish(a.project, a.repo, False if a.public else None, a.desc, a.org, a.remote, a.branch,
+                                   a.existing)
+                out(r, j, f"{'已新建并' if r['created'] else '已'}推送 {r['branch']} → {r['url']}")
+        elif a.cmd == "mcp":
+            from hub import mcp_server
+            mcp_server.serve()
+        elif a.cmd == "mcp-config":
+            from hub import mcp_server
+            r = mcp_server.config_snippets(sys.executable, str(core.ROOT / "hub.py"))
+            out(r, j, "Claude Code：\n  " + r["claude"] + "\n\nCodex（~/.codex/config.toml）：\n" + r["codex"]
+                + "\n\n通用 JSON：\n" + r["json"])
     except core.HubError as e:
         out({"error": str(e), **e.details}, j, f"错误：{e}")
         return 2

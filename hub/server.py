@@ -11,7 +11,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import core
+from . import core, github, manage, search
 
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 RUNS: dict[str, core.Run] = {}          # project id -> latest run
@@ -43,6 +43,19 @@ def api_get(path: str, q: dict) -> object:
         return reg
     if parts == ["scan"]:
         return core.scan(one("root", os.path.expanduser("~")), int(one("depth", "2")))
+    if parts == ["search"]:
+        return search.search_projects(one("q", ""), one("group") or None, q.get("tag", []), one("kind") or None)[:50]
+    if parts == ["grep"]:
+        return search.grep(one("pattern", ""), q.get("project") or None, one("group") or None, q.get("tag", []),
+                           one("regex") == "1", one("case") != "1", q.get("glob", []), int(one("max", "30")))
+    if parts == ["overview"]:
+        return manage.overview(one("group") or None)
+    if parts == ["github"]:
+        return github.status(verify=one("verify", "1") == "1")
+    if parts == ["mcp-config"]:
+        from . import mcp_server
+        return mcp_server.config_snippets(sys.executable.replace("pythonw.exe", "python.exe"),
+                                          str(core.ROOT / "hub.py"))
     if len(parts) >= 2 and parts[0] == "projects":
         proj = _project(parts[1])
         root = proj["path"]
@@ -87,9 +100,32 @@ def api_post(path: str, body: dict) -> object:
         return {"ok": True}
     if parts == ["pick-folder"]:
         return {"path": pick_folder(body.get("title", "选择项目文件夹"))}
+    if parts == ["batch"]:
+        return {"projects": manage.batch(body.get("projects") or [], body.get("group"), body.get("addTags"),
+                                         body.get("removeTags"), body.get("pinned"))}
+    if parts == ["prune"]:
+        return manage.prune(dry_run=not body.get("yes"))
+    if parts == ["github", "connect"]:
+        return github.connect(body.get("mode", "token"), body.get("token"), body.get("grants"),
+                              body.get("defaultPrivate", True))
+    if parts == ["github", "disconnect"]:
+        github.disconnect()
+        return {"ok": True}
+    if parts == ["github", "grants"]:
+        return github.set_grants(body.get("grants"), body.get("defaultPrivate"))
     if len(parts) >= 3 and parts[0] == "projects":
         proj = _project(parts[1])
         root, action = proj["path"], parts[2]
+        if action == "pin":
+            manage.set_pinned([proj["id"]], bool(body.get("pinned", True)))
+            return {"ok": True}
+        if action == "relocate":
+            return manage.relocate(proj["id"], body["path"])
+        if action == "publish":
+            # the user clicked it in the Hub: no agent grant needed, the GitHub connection still is
+            return github.publish("id:" + proj["id"], body.get("repoName") or None, body.get("private"),
+                                  body.get("description"), body.get("org") or None, body.get("remote") or "origin",
+                                  None, bool(body.get("existing")), check_grant=False)
         if action == "update":
             return core.update_project(proj["id"], body)
         if action == "remove":
@@ -154,6 +190,17 @@ def pick_folder(title: str) -> str:
     code = ("import tkinter as t, tkinter.filedialog as f, sys;"
             "r=t.Tk(); r.withdraw(); r.attributes('-topmost', True);"
             "sys.stdout.buffer.write((f.askdirectory(title=sys.argv[1]) or '').encode('utf-8'))")
+    import importlib.util
+    if importlib.util.find_spec("tkinter") is None and os.name == "nt":
+        # The bundled (embeddable) Python has no tkinter: use the Windows folder dialog instead.
+        ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8;Add-Type -AssemblyName System.Windows.Forms;"
+              "$d=New-Object System.Windows.Forms.FolderBrowserDialog;$d.Description=$env:HUB_TITLE;"
+              "$d.ShowNewFolderButton=$true;"
+              "if($d.ShowDialog((New-Object System.Windows.Forms.Form -Property @{TopMost=$true}))-eq'OK'){$d.SelectedPath}")
+        r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps], capture_output=True, timeout=600,
+                           env={**os.environ, "HUB_TITLE": title}, creationflags=core.NO_WINDOW)
+        out = r.stdout.decode("utf-8", "replace").strip()
+        return os.path.normpath(out) if out else ""
     exe = sys.executable.replace("python.exe", "pythonw.exe") if os.name == "nt" else sys.executable
     if not os.path.exists(exe):
         exe = sys.executable

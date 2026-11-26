@@ -3,3 +3,6 @@ data/
 __pycache__/
 *.pyc
 tools/__pycache__/
+dist/
+installer/cache/
+installer/build/

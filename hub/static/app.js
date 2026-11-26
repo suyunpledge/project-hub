@@ -22,6 +22,8 @@ function toast(msg, err = false) {
 }
 const guard = (fn) => async (...a) => { try { return await fn(...a); } catch (e) { toast(e.message, true); } };
 
+const SEL = new Set();  // sidebar multi-selection (project ids)
+let lastSelected = null;
 const S = {
   reg: { groups: [], projects: [] }, cfg: {}, pid: null, proj: null, tab: "source",
   files: [], fileRef: "", openFile: null, openLine: null, editing: false, collapsed: new Set(JSON.parse(localStorage.hubCollapsed || "[]")),
@@ -71,7 +73,7 @@ async function loadRegistry() {
     renderSidebar();
     if (S.proj) renderProjectGroup();
   }
-  $("#empty").hidden = !!S.pid;
+  showLanding();
 }
 
 function renderSidebar() {
@@ -112,16 +114,22 @@ function renderSidebar() {
       } finally { await loadRegistry(); }
     });
     const list = h("div", { className: "projects" });
-    for (const p of ps) {
-      const it = h("button", { type: "button", className: "proj-item" + (p.id === S.pid ? " active" : ""), draggable: true, title: p.path },
-        `${avatar(p)}<span class="nm-wrap"><span class="nm">${esc(p.name)}</span>` +
+    for (const p of [...ps].sort((x, y) => (y.pinned ? 1 : 0) - (x.pinned ? 1 : 0))) {
+      const it = h("button", { type: "button", className: "proj-item" + (p.id === S.pid ? " active" : "") +
+        (SEL.has(p.id) ? " selected" : ""), draggable: true, title: p.path + "\nCtrl/Shift+点击可多选" },
+        `${avatar(p)}<span class="nm-wrap"><span class="nm">${p.pinned ? '<svg class="ico pin-mark"><use href="#i-star"/></svg>' : ""}${esc(p.name)}</span>` +
         ((p.tags || []).length ? `<span class="tags">${p.tags.slice(0, 2).map((t) => tagChip(t, true)).join("")}` +
           (p.tags.length > 2 ? `<span class="more">+${p.tags.length - 2}</span>` : "") + "</span>" : "") +
         `</span><span class="st">` +
         (p.running ? `<i class="badge-dot run" title="运行中"></i>` : "") +
         (p.watching ? `<i class="badge-dot watch" title="实时检查中"></i>` : "") +
         (!p.exists ? `<i class="badge-dot missing" title="目录不存在"></i>` : "") + "</span>");
-      it.onclick = guard(() => selectProject(p.id));
+      it.dataset.id = p.id;
+      it.onclick = guard((ev) => {
+        if (ev.ctrlKey || ev.metaKey || ev.shiftKey) { toggleSelect(p.id, ev.shiftKey); return; }
+        if (SEL.size) clearSelection();
+        return selectProject(p.id);
+      });
       it.ondragstart = (ev) => ev.dataTransfer.setData("text/plain", p.id);
       list.append(it);
     }
@@ -162,12 +170,12 @@ async function selectProject(pid, keepTab = false) {
   resetActivity(); $("#tree").replaceChildren();
   $("#cm-branch").value = ""; $("#cm-msg").value = ""; $("#src-filter").value = "";
   $("#hist-detail").replaceChildren();
-  $("#empty").hidden = true; $("#project").hidden = true;
+  $("#empty").hidden = true; $("#home").hidden = true; $("#project").hidden = true;
   renderSidebar();
   try { await refreshProject(); }
   catch (e) {
     if (S.pid !== pid) return;
-    S.pid = null; location.hash = ""; $("#empty").hidden = false; renderSidebar();
+    S.pid = null; location.hash = ""; showLanding(true); renderSidebar();
     throw e;
   }
   if (S.pid !== pid) return;
@@ -226,7 +234,7 @@ function renderStats() {
     const last = gi.branches.find((b) => b.name === gi.branch);
     // size to the longest branch name (bold text measures short in auto-width selects)
     const longest = Math.max(gi.branch.length, ...gi.branches.map((b) => b.name.length));
-    html = card("#6d8cff", "branch", "当前分支", `<select id="branch-switch" title="切换工作区分支" style="width:calc(${longest}ch + 30px)">${opts || `<option>${esc(gi.branch)}</option>`}</select>`,
+    html = card("#6d8cff", "branch", "当前分支", `<select id="branch-switch" title="切换工作区分支" style="width:calc(${(longest * 1.15).toFixed(1)}ch + 36px)">${opts || `<option>${esc(gi.branch)}</option>`}</select>`,
         `${gi.branches.length} 个分支` + (gi.ahead || gi.behind ? ` · ↑${gi.ahead} ↓${gi.behind}` : "")) +
       card(gi.changes.length ? "#fbbf24" : "#34d399", "diff", "未提交改动", gi.changes.length ? `${gi.changes.length} 个文件` : "工作区干净",
         gi.changes.length ? esc(gi.changes.slice(0, 3).map((c) => c.path.split("/").pop()).join("、")) : "") +
@@ -933,7 +941,7 @@ window.addEventListener("beforeunload", (ev) => {
 guard(async () => {
   S.cfg = await api("config");
   await loadRegistry();
-  if (!(await openFromHash())) $("#empty").hidden = false;
+  if (!(await openFromHash())) showLanding(true);
 })();
 
 document.addEventListener("click", (ev) => {
@@ -1140,3 +1148,326 @@ document.addEventListener("click", (ev) => {
   resize();
   start();
 })();
+
+/* ================================================================ v4: overview, palette, GitHub, management */
+
+const relTime = (ts) => {
+  if (!ts) return "—";
+  const d = Date.now() / 1000 - ts;
+  return d < 60 ? "刚刚" : d < 3600 ? `${Math.floor(d / 60)} 分钟前` : d < 86400 ? `${Math.floor(d / 3600)} 小时前`
+    : d < 86400 * 30 ? `${Math.floor(d / 86400)} 天前` : new Date(ts * 1000).toLocaleDateString();
+};
+
+/* ---------------- landing: overview dashboard (or welcome hero when nothing is registered) */
+let homeLoadedAt = 0;
+function showLanding(force = false) {
+  const landing = !S.pid;
+  const hasProjects = S.reg.projects.length > 0;
+  $("#empty").hidden = !landing || hasProjects;
+  $("#home").hidden = !landing || !hasProjects;
+  if (landing && hasProjects && (force || Date.now() - homeLoadedAt > 30000)) loadHome();
+}
+
+const loadHome = guard(async () => {
+  homeLoadedAt = Date.now();
+  $("#home-sub").textContent = "正在读取各项目状态…";
+  const r = await api("overview");
+  if (S.pid) return;
+  const sm = r.summary;
+  $("#home-sub").textContent = `${sm.projects} 个项目 · 读取用时 ${r.seconds}s`;
+  const card = (c, icon, n, label, filter) =>
+    `<button class="home-card${n ? "" : " zero"}" style="--c:${c}" data-filter="${filter}">${ico(icon)}<b>${n}</b><span>${label}</span></button>`;
+  $("#home-cards").innerHTML =
+    card("#6d8cff", "layers", sm.projects, "全部项目", "all") +
+    card("#fbbf24", "diff", sm.dirty, "有未提交改动", "dirty") +
+    card("#34d399", "upload", sm.ahead, "待推送", "ahead") +
+    card("#22d3ee", "history", sm.behind, "落后上游", "behind") +
+    card("#c084fc", "github", sm.noRemote, "未配置远端", "noremote") +
+    card("#f87171", "alert", sm.missing, "目录失效", "missing");
+  S.homeRows = r.projects;
+  renderHomeTable(S.homeFilter || "all");
+  $$("#home-cards .home-card").forEach((b) => (b.onclick = () => renderHomeTable(b.dataset.filter)));
+});
+
+function renderHomeTable(filter) {
+  S.homeFilter = filter;
+  $$("#home-cards .home-card").forEach((b) => b.classList.toggle("on", b.dataset.filter === filter));
+  const test = {
+    all: () => true, dirty: (p) => p.changes, ahead: (p) => p.ahead, behind: (p) => p.behind,
+    noremote: (p) => p.git && !p.remote, missing: (p) => !p.exists,
+  }[filter];
+  const rows = (S.homeRows || []).filter(test);
+  const g = (id) => groupOf(id);
+  $("#home-table").innerHTML = `<thead><tr><th>项目</th><th>分组</th><th>分支</th><th>状态</th><th>最近提交</th><th>远端</th></tr></thead><tbody>` +
+    (rows.length ? rows.map((p) => {
+      const state = !p.exists ? `<span class="st-chip bad">目录失效</span>` : !p.git ? `<span class="st-chip">非 git</span>` :
+        (p.changes ? `<span class="st-chip warn">✎ ${p.changes}</span>` : `<span class="st-chip ok">干净</span>`) +
+        (p.ahead ? `<span class="st-chip ok">↑${p.ahead}</span>` : "") + (p.behind ? `<span class="st-chip info">↓${p.behind}</span>` : "");
+      const remote = p.remote ? (p.remote.includes("github.com") ? `${ico("github", "sm")} ${esc(p.remote.replace(/^https:\/\/github.com\//, "").replace(/\.git$/, ""))}` : esc(p.remote))
+        : p.git ? `<span class="muted">—</span>` : "";
+      return `<tr data-id="${esc(p.id)}"><td><div class="cell-name">${avatar(p)}<div><b>${p.pinned ? ico("star", "pin-mark") : ""}${esc(p.name)}</b>` +
+        `<div class="tags">${(p.tags || []).slice(0, 3).map((t) => tagChip(t, true)).join("")}</div></div></div></td>` +
+        `<td><span class="group-chip" style="--gc:${g(p.group).color}">${esc(g(p.group).name)}</span></td>` +
+        `<td>${p.git ? `<code>${esc(p.branch || "—")}</code>` : ""}</td><td class="st-cell">${state}</td>` +
+        `<td><div class="ellipsis">${esc(p.lastCommit?.subject || "—")}</div><div class="muted small">${relTime(p.lastCommit?.time)}</div></td>` +
+        `<td class="remote-cell">${remote}</td></tr>`;
+    }).join("") : `<tr><td colspan="6" class="muted empty-row">没有符合条件的项目</td></tr>`) + "</tbody>";
+  $$("#home-table tbody tr[data-id]").forEach((tr) => (tr.onclick = guard(() => selectProject(tr.dataset.id))));
+}
+$("#btn-home").onclick = guard(async () => {
+  if (S.pid && !canLeaveFile()) return;
+  S.pid = null; S.proj = null; location.hash = ""; $("#project").hidden = true; renderSidebar(); showLanding(true);
+});
+$("#home-refresh").onclick = () => loadHome();
+$("#home-scan").onclick = () => scanDialog();
+
+/* ---------------- project header: pin, publish, missing folder */
+const _refreshProject = refreshProject;
+refreshProject = async function () {
+  await _refreshProject();
+  const p = S.proj;
+  if (!p) return;
+  const reg = S.reg.projects.find((x) => x.id === p.id) || p;
+  $("#btn-pin").classList.toggle("on", !!reg.pinned);
+  $("#btn-pin").title = reg.pinned ? "取消置顶" : "置顶";
+  const gi = p.gitInfo;
+  const onGitHub = gi.git && /github\.com/.test(gi.remote || "");
+  $("#btn-publish").hidden = !gi.git || onGitHub;
+  $("#btn-publish span").textContent = gi.remote ? "另建 GitHub 仓库" : "发布到 GitHub";
+  $("#p-missing").hidden = reg.exists !== false;
+};
+$("#btn-pin").onclick = guard(async () => {
+  const reg = S.reg.projects.find((x) => x.id === S.pid);
+  await api(`projects/${S.pid}/pin`, { pinned: !reg?.pinned });
+  await loadRegistry(); await refreshProject();
+});
+$("#btn-relocate").onclick = guard(async () => {
+  const r = await api("pick-folder", { title: `为「${S.proj.name}」选择新位置` });
+  if (!r.path) return;
+  await api(`projects/${S.pid}/relocate`, { path: r.path });
+  toast(`已更新路径：${r.path}`);
+  await loadRegistry(); const pid = S.pid; S.pid = null; S.proj = null; await selectProject(pid);
+});
+$("#btn-unregister").onclick = guard(async () => {
+  if (!confirm(`从仓库移除「${S.proj.name}」的登记？（不会删除任何文件）`)) return;
+  await api(`projects/${S.pid}/remove`, {});
+  S.pid = null; S.proj = null; location.hash = ""; $("#project").hidden = true;
+  await loadRegistry(); showLanding(true);
+});
+
+$("#btn-publish").onclick = guard(async () => {
+  const gh = await api("github?verify=0");
+  if (!gh.connected) { toast("请先连接 GitHub", true); return githubDialog(); }
+  const p = S.proj;
+  const slug = p.name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[-.]+|[-.]+$/g, "") || "project";
+  const b = await dialog("发布到 GitHub",
+    `<p class="hint">在 <b>${esc(gh.login || "你的账号")}</b> 下新建仓库，添加为远端 <code>origin</code>，并推送当前分支 <code>${esc(p.gitInfo.branch)}</code>。</p>` +
+    `<label class="field">仓库名<input name="repo" value="${esc(slug)}" pattern="[A-Za-z0-9._-]{1,100}" required></label>` +
+    `<label class="field">描述<input name="desc" value="${esc(p.description || "")}"></label>` +
+    `<label class="check"><input type="checkbox" name="private" ${gh.defaultPrivate ? "checked" : ""}> 私有仓库</label>` +
+    `<label class="check"><input type="checkbox" name="existing"> 仓库已存在，只连接并推送</label>` +
+    (p.gitInfo.remote ? `<p class="hint">已有远端 origin，将添加为远端 <code>github</code>。</p>` : ""), "发布");
+  if (!b) return;
+  const v = (n) => b.querySelector(`[name=${n}]`);
+  toast("正在发布…");
+  const r = await api(`projects/${S.pid}/publish`, {
+    repoName: v("repo").value.trim(), description: v("desc").value.trim(), private: v("private").checked,
+    existing: v("existing").checked, remote: p.gitInfo.remote ? "github" : "origin" });
+  toast(`${r.created ? "已新建并推送" : "已推送"}：${r.repo}`);
+  await refreshProject(); loadHome();
+});
+
+/* ---------------- GitHub connection dialog */
+const githubDialog = guard(async () => {
+  const st = await api("github");
+  const mcp = await api("mcp-config").catch(() => null);
+  const grants = st.grants || {};
+  const connected = st.connected;
+  const head = connected
+    ? `<div class="gh-card ${st.ok === false ? "bad" : ""}">${st.avatar ? `<img src="${esc(st.avatar)}" alt="">` : ico("github")}
+        <div><b>${esc(st.login || "已连接")}</b><div class="muted small">${{ token: "个人访问令牌（已加密保存）", "git-credential": "复用 Git 的 GitHub 登录", env: "环境变量 GITHUB_TOKEN" }[st.mode] || ""}</div>
+        ${st.ok === false ? `<div class="err-text small">${esc(st.error)}</div>` : ""}</div></div>`
+    : `<p class="hint">授权后，你可以一键把项目发布到 GitHub；Agent 也能通过 MCP 新建仓库、推送更新（以下权限可随时关闭）。</p>
+       <div class="seg"><label><input type="radio" name="mode" value="git-credential" checked> 复用 Git 已登录的账号</label>
+       <label><input type="radio" name="mode" value="token"> 粘贴个人访问令牌</label></div>
+       <label class="field" data-token hidden>令牌（需要 repo 权限，或细粒度令牌的 Administration + Contents 读写）
+         <input name="token" type="password" autocomplete="off" placeholder="ghp_… 或 github_pat_…"></label>
+       <p class="hint small"><a href="https://github.com/settings/tokens/new?scopes=repo&description=Project%20Hub" target="_blank">在 GitHub 创建令牌 ↗</a></p>`;
+  const body = head + `
+    <h4 class="sec">允许 Agent</h4>
+    <label class="check"><input type="checkbox" name="createRepo" ${!connected || grants.createRepo ? "checked" : ""}> 新建 GitHub 仓库</label>
+    <label class="check"><input type="checkbox" name="push" ${!connected || grants.push ? "checked" : ""}> 推送到 GitHub 仓库</label>
+    <label class="check"><input type="checkbox" name="private" ${st.defaultPrivate !== false ? "checked" : ""}> 新建仓库默认私有</label>
+    ${mcp ? `<h4 class="sec">在 Agent 中注册 MCP</h4>
+      <div class="snip"><span>Claude Code</span><code>${esc(mcp.claude)}</code><button type="button" class="ghost small icon-only" data-copy="${esc(mcp.claude)}">${ico("copy")}</button></div>
+      <div class="snip"><span>Codex</span><code>${esc(mcp.codex)}</code><button type="button" class="ghost small icon-only" data-copy="${esc(mcp.codex)}">${ico("copy")}</button></div>` : ""}
+    ${connected ? `<p><button type="button" class="ghost small danger-text" data-disconnect>断开 GitHub</button></p>` : ""}`;
+  const b = await dialog("GitHub", body, connected ? "保存" : "连接", (el) => {
+    el.querySelectorAll("[name=mode]").forEach((r) => (r.onchange = () => (el.querySelector("[data-token]").hidden = r.value !== "token" || !r.checked)));
+    el.querySelectorAll("[data-copy]").forEach((btn) => (btn.onclick = () => { navigator.clipboard.writeText(btn.dataset.copy); toast("已复制"); }));
+    const dis = el.querySelector("[data-disconnect]");
+    if (dis) dis.onclick = guard(async () => {
+      if (!confirm("断开后 Agent 将无法新建仓库或推送到 GitHub。继续？")) return;
+      await api("github/disconnect", {}); $("#dlg").close(); toast("已断开 GitHub"); refreshGithubDot();
+    });
+  });
+  if (!b) return;
+  const v = (n) => b.querySelector(`[name=${n}]`);
+  const grantsNew = { createRepo: v("createRepo").checked, push: v("push").checked };
+  if (connected) {
+    await api("github/grants", { grants: grantsNew, defaultPrivate: v("private").checked });
+    toast("已保存 GitHub 权限");
+  } else {
+    const mode = b.querySelector("[name=mode]:checked").value;
+    const r = await api("github/connect", { mode, token: mode === "token" ? v("token").value : undefined,
+      grants: grantsNew, defaultPrivate: v("private").checked });
+    toast(`已连接 GitHub：${r.login}`);
+  }
+  refreshGithubDot();
+});
+async function refreshGithubDot() {
+  const st = await api("github?verify=0").catch(() => null);
+  $("#gh-dot").className = "gh-dot" + (st?.connected ? " on" : "");
+  $("#btn-github").title = st?.connected ? `GitHub：${st.login || "已连接"}` : "连接 GitHub";
+}
+$("#btn-github").onclick = githubDialog;
+refreshGithubDot();
+
+/* ---------------- sidebar multi-select + batch actions */
+function toggleSelect(id, range) {
+  if (range && lastSelected) {
+    const order = $$("#groups .proj-item").map((el) => el.dataset.id);
+    const [a, b] = [order.indexOf(lastSelected), order.indexOf(id)].sort((x, y) => x - y);
+    if (a >= 0 && b >= 0) order.slice(a, b + 1).forEach((x) => SEL.add(x));
+  } else if (SEL.has(id)) SEL.delete(id); else SEL.add(id);
+  lastSelected = id;
+  renderSidebar(); renderBatchBar();
+}
+function clearSelection() { SEL.clear(); lastSelected = null; renderSidebar(); renderBatchBar(); }
+function renderBatchBar() {
+  $("#batch-bar").hidden = !SEL.size;
+  $("#batch-count").textContent = SEL.size;
+}
+$("#batch-clear").onclick = clearSelection;
+$("#batch-group").onclick = guard(async () => {
+  const b = await dialog(`移动 ${SEL.size} 个项目`, groupField("default"), "移动", wireGroup);
+  if (!b) return;
+  const gid = b.querySelector("[name=group]").value;
+  const group = gid === "__new" ? b.querySelector("[name=newgroup]").value.trim() : gid;
+  await api("batch", { projects: [...SEL].map((x) => "id:" + x), group });
+  toast(`已移动 ${SEL.size} 个项目`); clearSelection(); await loadRegistry();
+});
+$("#batch-tag").onclick = guard(async () => {
+  const b = await dialog(`为 ${SEL.size} 个项目编辑标签`,
+    `<label class="field">添加标签（空格或逗号分隔）<input name="add" placeholder="例如：客户端 待发布"></label>
+     <label class="field">移除标签<input name="remove"></label>`, "应用");
+  if (!b) return;
+  const split = (x) => x.split(/[\s,，]+/).filter(Boolean);
+  await api("batch", { projects: [...SEL].map((x) => "id:" + x), addTags: split(b.querySelector("[name=add]").value),
+    removeTags: split(b.querySelector("[name=remove]").value) });
+  toast("已更新标签"); clearSelection(); await loadRegistry();
+});
+$("#batch-pin").onclick = guard(async () => {
+  const allPinned = [...SEL].every((id) => S.reg.projects.find((p) => p.id === id)?.pinned);
+  await api("batch", { projects: [...SEL].map((x) => "id:" + x), pinned: !allPinned });
+  toast(allPinned ? "已取消置顶" : "已置顶"); clearSelection(); await loadRegistry();
+});
+
+/* ---------------- command palette: projects + code search across projects */
+const PAL = { mode: "projects", items: [], index: 0, seq: 0 };
+function openPalette(mode = "projects") {
+  $("#palette").hidden = false;
+  setPalMode(mode);
+  $("#pal-q").focus(); $("#pal-q").select();
+  runPalette();
+}
+function closePalette() { $("#palette").hidden = true; }
+function setPalMode(mode) {
+  PAL.mode = mode;
+  $("#pal-mode").textContent = mode === "code" ? "代码" : "项目";
+  $("#pal-mode").classList.toggle("code", mode === "code");
+  $("#pal-opts").hidden = mode !== "code";
+  $("#pal-q").placeholder = mode === "code" ? "在所有项目中搜索代码…  回车搜索" : "项目名、标签、备注…  Tab 切换到代码搜索";
+}
+let palTimer = 0;
+function runPalette(now = false) {
+  clearTimeout(palTimer);
+  if (PAL.mode === "code" && !now) return;  // code search runs on Enter
+  palTimer = setTimeout(guard(async () => {
+    const q = $("#pal-q").value.trim();
+    const seq = ++PAL.seq;
+    if (PAL.mode === "projects") {
+      const res = await api("search?" + qs({ q }));
+      if (seq !== PAL.seq) return;
+      PAL.items = res.map((p) => ({ kind: "project", p }));
+      $("#pal-results").innerHTML = res.length ? res.map((p, i) =>
+        `<div class="pal-item" data-i="${i}">${avatar(p)}<div class="pal-main"><b>${esc(p.name)}</b>` +
+        `<span class="muted small">${esc(p.groupName)} · ${esc(p.path)}</span></div>` +
+        `<div class="pal-tags">${(p.tags || []).slice(0, 3).map((t) => tagChip(t, true)).join("")}${p.fuzzy ? '<span class="st-chip">模糊</span>' : ""}</div></div>`).join("")
+        : `<div class="pal-empty">${q ? `没有匹配「${esc(q)}」的项目。按 Tab 改为在代码中搜索。` : "还没有登记项目"}</div>`;
+    } else {
+      if (!q) { $("#pal-results").innerHTML = `<div class="pal-empty">输入要找的文字，回车搜索所有项目的文件内容</div>`; PAL.items = []; return; }
+      $("#pal-stat").textContent = "搜索中…";
+      const r = await api("grep?" + qs({ pattern: q, regex: $("#pal-regex").checked ? 1 : "", case: $("#pal-case").checked ? 1 : "",
+        glob: $("#pal-glob").value.trim(), max: 20 }));
+      if (seq !== PAL.seq) return;
+      $("#pal-stat").textContent = `${r.total} 处 · ${r.matched}/${r.projects} 个项目 · ${r.seconds}s`;
+      PAL.items = [];
+      let html = "";
+      for (const res of r.results) {
+        html += `<div class="pal-group">${esc(res.name)} <span class="muted small">${res.hits.length}${res.truncated ? "+" : ""}</span>${res.error ? `<span class="err-text small"> ${esc(res.error)}</span>` : ""}</div>`;
+        for (const hit of res.hits) {
+          const i = PAL.items.push({ kind: "hit", id: res.id, hit }) - 1;
+          const text = esc(hit.text);
+          html += `<div class="pal-item hit" data-i="${i}">${fileIcon(hit.file.split("/").pop())}<code class="pal-file">${esc(hit.file)}:${hit.line}</code><span class="pal-line">${text}</span></div>`;
+        }
+      }
+      $("#pal-results").innerHTML = html || `<div class="pal-empty">没有找到「${esc(q)}」</div>`;
+    }
+    PAL.index = 0; markPal();
+    $$("#pal-results .pal-item").forEach((el) => {
+      el.onmouseenter = () => { PAL.index = +el.dataset.i; markPal(false); };
+      el.onclick = () => choosePal(+el.dataset.i);
+    });
+  }), now ? 0 : 120);
+}
+function markPal(scroll = true) {
+  $$("#pal-results .pal-item").forEach((el) => el.classList.toggle("on", +el.dataset.i === PAL.index));
+  if (scroll) $(`#pal-results .pal-item[data-i="${PAL.index}"]`)?.scrollIntoView({ block: "nearest" });
+}
+const choosePal = guard(async (i) => {
+  const it = PAL.items[i];
+  if (!it) return;
+  closePalette();
+  if (it.kind === "project") return selectProject(it.p.id);
+  if (S.pid !== it.id) await selectProject(it.id);
+  if (S.pid !== it.id) return;
+  switchTab("source");
+  await openFile(it.hit.file, it.hit.line);
+});
+$("#btn-palette").onclick = () => openPalette();
+$("#palette").onclick = (e) => { if (e.target.id === "palette") closePalette(); };
+$("#pal-q").oninput = () => runPalette();
+["#pal-regex", "#pal-case"].forEach((x) => ($(x).onchange = () => runPalette(true)));
+$("#pal-glob").onkeydown = (e) => { if (e.key === "Enter") runPalette(true); };
+$("#pal-q").onkeydown = (e) => {
+  if (e.key === "Escape") { closePalette(); return; }
+  if (e.key === "Tab") { e.preventDefault(); setPalMode(PAL.mode === "code" ? "projects" : "code"); runPalette(true); return; }
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    const n = PAL.items.length;
+    if (n) { PAL.index = (PAL.index + (e.key === "ArrowDown" ? 1 : n - 1)) % n; markPal(); }
+    return;
+  }
+  if (e.key === "Enter") {
+    e.preventDefault();
+    if (PAL.mode === "code" && (!PAL.items.length || PAL.lastQ !== $("#pal-q").value)) { PAL.lastQ = $("#pal-q").value; runPalette(true); }
+    else choosePal(PAL.index);
+  }
+};
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "f") { e.preventDefault(); openPalette("code"); }
+  if (e.key === "Escape" && !$("#palette").hidden) closePalette();
+  if (e.key === "Escape" && SEL.size && $("#palette").hidden) clearSelection();
+});

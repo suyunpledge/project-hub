@@ -1,0 +1,55 @@
+name: Build installer
+
+# Push a tag like v1.1.0 → tests run, the Windows installer is built and attached to a GitHub Release.
+# "Run workflow" by hand → same build, installer uploaded as a workflow artifact only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tag matches app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path hub/__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match hub.__version__ $v" }
+
+      - name: Tests
+        shell: pwsh
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.com"
+          git config --global init.defaultBranch main
+          python -m pip install --quiet pytest ruff
+          python -m pytest -q -p no:cacheprovider tests
+
+      - name: Build installer
+        run: python installer/build.py --download
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ProjectHub-Setup
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem dist -File | ForEach-Object { $_.FullName }
+          gh release create "${{ github.ref_name }}" $files --title "Project Hub ${{ github.ref_name }}" --generate-notes `
+            --notes "下载 **ProjectHub-Setup-*.exe**，双击即可安装（自带 Python 运行时，需要已安装 Git）。"

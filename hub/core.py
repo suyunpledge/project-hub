@@ -23,7 +23,11 @@ from pathlib import Path
 from . import push_lock, push_preview
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.environ.get("PROJECT_HUB_DATA", ROOT / "data"))
+# An installed copy (marker written by the installer) keeps its data outside the program folder,
+# so upgrades and reinstalls never touch the registry. A source checkout keeps it in ./data.
+INSTALLED = (ROOT / ".installed").exists()
+_DEFAULT_DATA = (Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "ProjectHub" / "data") if INSTALLED else ROOT / "data"
+DATA_DIR = Path(os.environ.get("PROJECT_HUB_DATA", _DEFAULT_DATA))
 REGISTRY_FILE = DATA_DIR / "hub.json"
 
 SKIP_DIRS = {
@@ -54,12 +58,42 @@ def _default_registry() -> dict:
     return {"groups": [{"id": "default", "name": "未分组", "color": "#64748b"}], "projects": []}
 
 
+def _parse_registry(text: str) -> dict:
+    reg = json.loads(text)
+    if not isinstance(reg, dict) or not isinstance(reg.get("projects", []), list) \
+            or not isinstance(reg.get("groups", []), list):
+        raise ValueError("registry has the wrong shape")
+    for p in reg.get("projects", []):
+        if not isinstance(p, dict) or not isinstance(p.get("id"), str) or not isinstance(p.get("path"), str):
+            raise ValueError("registry has a malformed project entry")
+        p.setdefault("name", p["id"])
+        p.setdefault("group", "default")
+        for k in ("run", "check", "preview", "description"):
+            p.setdefault(k, "")
+    return reg
+
+
 def load_registry() -> dict:
+    """Read the registry. A corrupt file (crash mid-write, bad hand edit) falls back to the
+    last good backup; the broken file is kept as ``hub.corrupt-<time>.json`` for inspection."""
     with _reg_lock:
         if not REGISTRY_FILE.exists():
             return _default_registry()
-        reg = json.loads(REGISTRY_FILE.read_text("utf-8"))
-        if not any(g["id"] == "default" for g in reg.get("groups", [])):
+        try:
+            reg = _parse_registry(REGISTRY_FILE.read_text("utf-8-sig"))
+        except (ValueError, UnicodeDecodeError) as err:
+            backup = REGISTRY_FILE.with_suffix(".json.bak")
+            try:
+                reg = _parse_registry(backup.read_text("utf-8-sig"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                raise HubError(f"登记文件 {REGISTRY_FILE} 已损坏且没有可用备份（{err}）。"
+                               "请修复该 JSON 文件，或将其改名后重新登记项目。", code="registry_corrupt") from err
+            try:
+                os.replace(REGISTRY_FILE, REGISTRY_FILE.with_name(f"hub.corrupt-{int(time.time())}.json"))
+                save_registry(reg)
+            except OSError:
+                pass  # still usable read-only; the next successful save repairs it
+        if not any(g.get("id") == "default" for g in reg.get("groups", [])):
             reg.setdefault("groups", []).insert(0, _default_registry()["groups"][0])
         reg.setdefault("projects", [])
         return reg
@@ -68,6 +102,12 @@ def load_registry() -> dict:
 def save_registry(reg: dict) -> None:
     with _reg_lock:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if REGISTRY_FILE.exists():  # keep the previous good version as a fallback
+            try:
+                _parse_registry(REGISTRY_FILE.read_text("utf-8-sig"))
+                shutil.copyfile(REGISTRY_FILE, REGISTRY_FILE.with_suffix(".json.bak"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                pass
         tmp = REGISTRY_FILE.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(reg, ensure_ascii=False, indent=2), "utf-8")
         for attempt in range(20):  # Windows: a reader may briefly hold the file open
@@ -157,34 +197,10 @@ def _resolve_project(projects: list[dict], ref: str, *, prefer_id: bool = False)
 
 
 def search_projects(query: str, group: str | None, tags: list[str], kind: str | None,
-                    missing: bool) -> list[dict]:
-    reg = load_registry()
-    selected_group = find_group(reg, group) if group else None
-    if group and not selected_group:
-        raise HubError(f"找不到分组：{group}")
-    groups = {g["id"]: g["name"] for g in reg["groups"]}
-    words = query.casefold().split()
-    required = {tag.strip().casefold() for tag in tags}
-    results = []
-    for p in reg["projects"]:
-        if selected_group and selected_group["id"] != p["group"]:
-            continue
-        labels = p.get("tags", [])
-        if not required.issubset(t.casefold() for t in labels):
-            continue
-        group_name = groups.get(p["group"], p["group"])
-        fields = (p["id"], p["name"], p["path"], p["group"], group_name, p.get("description", ""), *labels)
-        haystack = "\n".join(fields).casefold()
-        if not all(w in haystack for w in words):
-            continue
-        exists = os.path.isdir(p["path"])
-        if missing and exists:
-            continue
-        if kind and (not exists or kind.casefold() not in detect(p["path"])["kinds"]):
-            continue
-        results.append({**p, "ref": "id:" + p["id"], "tags": labels, "groupName": group_name, "exists": exists})
-    exact = query.strip().casefold()
-    return sorted(results, key=lambda p: (exact not in (p["id"].casefold(), p["name"].casefold()), p["id"]))
+                    missing: bool, fuzzy: bool = True) -> list[dict]:
+    """Ranked project search; see :func:`hub.search.search_projects`."""
+    from .search import search_projects as ranked
+    return ranked(query, group, tags, kind, missing, fuzzy)
 
 
 def edit_tags(ref: str, add: list[str], remove: list[str]) -> dict:
@@ -267,7 +283,7 @@ def ensure_group(reg: dict, name_or_id: str, color: str | None = None) -> str:
 
 
 def update_project(pid: str, fields: dict) -> dict:
-    allowed = {"name", "group", "run", "check", "preview", "description"}
+    allowed = {"name", "group", "run", "check", "preview", "description", "pinned"}
     with transaction() as reg:
         for p in reg["projects"]:
             if p["id"] == pid:
@@ -276,6 +292,15 @@ def update_project(pid: str, fields: dict) -> dict:
                         k, v = "group", _existing_group_id(reg, v)
                     elif k == "group":
                         v = ensure_group(reg, v or "default")
+                    elif k == "pinned":
+                        if not isinstance(v, bool):
+                            raise HubError("pinned 必须是 true 或 false")
+                    elif k in allowed:
+                        if not isinstance(v, str) or len(v) > 4000:
+                            raise HubError(f"{k} 必须是不超过 4000 字的文本")
+                        v = v.strip()
+                        if k == "name" and not v:
+                            raise HubError("显示名不能为空")
                     if k in allowed:
                         p[k] = v
                 return p
@@ -434,9 +459,25 @@ def detect(path: str) -> dict:
 
 # --------------------------------------------------------------------- git
 
+_git_extra = threading.local()
+
+
+@contextmanager
+def git_environment(extra: dict | None):
+    """Add environment variables to every git call made by this thread (e.g. push credentials).
+    Values go through the environment, never the command line, so they don't show in process lists."""
+    previous = getattr(_git_extra, "env", None)
+    _git_extra.env = {**(previous or {}), **(extra or {})}
+    try:
+        yield
+    finally:
+        _git_extra.env = previous
+
+
 def _run_git(path: str, *args: str, env: dict | None = None,
              input: str | None = None, lock_fd: int | None = None) -> subprocess.CompletedProcess:
-    full_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C.UTF-8", **(env or {})}
+    full_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C.UTF-8",
+                **(getattr(_git_extra, "env", None) or {}), **(env or {})}
     with push_lock.child_options(lock_fd) as options:
         return subprocess.run(["git", "-c", "core.quotepath=false", "-C", path, *args],
                               capture_output=True, env=full_env, input=input.encode() if input else None,
@@ -497,8 +538,10 @@ def push_project(project: dict, branch: str | None, remote: str | None, target: 
                  dry_run: bool, preview_id: str | None = None) -> dict:
     # The lock covers the Git operation and its receipt, but never other projects' Git operations.
     key = hashlib.sha256(project["id"].encode("utf-8")).hexdigest()
+    from . import github  # local import: github imports core
     try:
-        with push_lock.acquire(DATA_DIR / f"push-{key}.lock", wait=dry_run or preview_id is not None) as fd:
+        with push_lock.acquire(DATA_DIR / f"push-{key}.lock", wait=dry_run or preview_id is not None) as fd, \
+                git_environment(github.push_env(project["path"])):
             return _push_project_locked(project, branch, remote, target, dry_run, preview_id, fd)
     except push_lock.PushBusy:
         raise HubError("此项目的预演或 Git 推送仍在执行，请等待结束后用原参数重试。", code="push_busy")
@@ -515,7 +558,20 @@ def _record_preview(reg: dict, snapshot: dict, status: str) -> None:
     del history[:-64]
 
 
+PREVIEW_TTL = 30 * 60  # seconds; an unused dry run stops blocking plain pushes after this
+
+
+def _expire_preview(pid: str) -> None:
+    with transaction() as reg:
+        pending = reg.get("pushPreviews", {}).get(pid)
+        if pending and not pending.get("attempted") and \
+                time.time() - pending.get("createdAt", 0) > PREVIEW_TTL:
+            _record_preview(reg, pending, "expired")
+            del reg["pushPreviews"][pid]
+
+
 def _pending_preview(pid: str, preview_id: str | None) -> dict | None:
+    _expire_preview(pid)
     reg = load_registry()
     pending = reg.get("pushPreviews", {}).get(pid)
     if preview_id is None:
@@ -531,8 +587,9 @@ def _pending_preview(pid: str, preview_id: str | None) -> dict | None:
         action = "已核实目标分支收到" if receipt.get("recovered") else "已经成功推送"
         raise HubError(f"该预演编号{action} {receipt['sha'][:12]}（{receipt['remote']}/{receipt['target']}）。"
                        "本次未重复推送。", code="preview_already_pushed", project=pid, **receipt)
-    reason = "superseded" if receipt else "unknown"
-    message = "该编号已被后续成功的预演替代" if receipt else "此项目没有该编号的预演记录"
+    reason = receipt["status"] if receipt and receipt["status"] == "expired" else "superseded" if receipt else "unknown"
+    message = ("该预演已超过 30 分钟未使用，已失效" if reason == "expired"
+               else "该编号已被后续成功的预演替代" if receipt else "此项目没有该编号的预演记录")
     hint = "请用 --dry-run 重新预演，并传回自己收到的编号。"
     raise HubError(message + "。" + hint, code="preview_stale", changes=["preview_id"],
                    reason=reason, hint=hint, project=pid, previewId=preview_id)
@@ -883,7 +940,7 @@ def _push_project_locked(project: dict, branch: str | None, remote: str | None, 
             raise
         tips = [tip]
     if dry_run:
-        snapshot.update(tips=tips, previewId=uuid.uuid4().hex)
+        snapshot.update(tips=tips, previewId=uuid.uuid4().hex, createdAt=time.time())
         with transaction() as reg:
             if not any(p["id"] == pid and p["path"] == path for p in reg["projects"]):
                 raise _stale_preview(["preview_id"], context)
@@ -891,10 +948,22 @@ def _push_project_locked(project: dict, branch: str | None, remote: str | None, 
             if pid in previews:
                 _record_preview(reg, previews[pid], "superseded")
             previews[pid] = snapshot
-        context.update(previewId=snapshot["previewId"], remoteTips=snapshot["tips"])
-    elif saved:
-        _finish_push(saved, context)
+        context.update(previewId=snapshot["previewId"], remoteTips=snapshot["tips"],
+                       expiresAt=snapshot["createdAt"] + PREVIEW_TTL)
+    else:
+        if saved:
+            _finish_push(saved, context)
+        context["upstreamSet"] = _ensure_upstream(path, branch, remote, target)
     return {**context, "upToDate": up_to_date}
+
+
+def _ensure_upstream(path: str, branch: str, remote: str, target: str) -> bool:
+    """After a real push, let the branch track what it was pushed to — only if it tracks nothing yet."""
+    if git(path, "config", "--get", f"branch.{branch}.remote", check=False).strip():
+        return False
+    ok = _run_git(path, "config", f"branch.{branch}.remote", remote).returncode == 0
+    ok = ok and _run_git(path, "config", f"branch.{branch}.merge", f"refs/heads/{target}").returncode == 0
+    return ok
 
 
 def git_info(path: str) -> dict:

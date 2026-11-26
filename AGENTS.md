@@ -142,8 +142,48 @@ python hub.py set <项目> check "npx tsc --noEmit"
 python hub.py group "分组名" <项目> <项目> ...
 ```
 
+## 6. 跨项目搜索代码与总览
+
+```
+python hub.py grep "关键字" [项目 ...] [--group G] [--tag T] [--glob "*.py"] [--regex] [--case] [--max 50] --json
+python hub.py overview [--group G] --json     # 每个项目的分支、未提交改动、↑领先/↓落后、最近提交、远端
+```
+
+`find` 按相关度排序（名称精确 > 前缀 > 名称包含 > 标签 > 备注 > 路径）；精确匹配不到时返回模糊匹配，
+结果带 `fuzzy: true`，请核对后再用。
+
+## 7. 登记管理
+
+```
+python hub.py pin <项目>... / unpin <项目>...
+python hub.py relocate <项目> <新目录>        # 项目文件夹被移动或改名后
+python hub.py prune [--yes]                    # 列出（--yes 则移除）目录已不存在的登记
+```
+
+## 8. GitHub：建仓与发布（需要用户授权）
+
+用户在 Project Hub 的「GitHub」设置中授权后才可用，并且只能做用户允许的操作（新建仓库 / 推送）。
+
+```
+python hub.py github status --json
+python hub.py github publish <项目> [--repo 名称] [--desc 说明] [--public] [--existing] --json
+python hub.py github create-repo <名称> [--public] [--desc 说明] --json
+```
+
+- `publish` 会新建仓库（默认私有）、把它加为 `origin` 并推送当前分支；再次运行只推送更新，不会重复建仓。
+- 未授权返回 `github_not_connected`，未获该项权限返回 `github_not_granted`：请告诉用户去 GitHub 设置里开启，不要绕过。
+- 已推到 GitHub 的项目，之后用 `commit` + `push` 提交更新即可。
+
+## 9. MCP
+
+`python hub.py mcp` 以 MCP 服务器运行（stdio），工具与上面的命令一一对应；`python hub.py mcp-config` 打印注册配置。
+
+推送预演（`push --dry-run`）30 分钟内有效；过期后不再阻挡普通推送，旧编号返回 `preview_stale` + `reason=expired`。
+成功推送后，若本地分支还没有上游，会自动设为推送的目标分支。
+
 ## 规则
 
 - 只提交你自己改过的文件；不要用 Hub 去改别的项目。
 - 用户要求实际推送时使用 `push`，核对目标时使用 `push --dry-run`。
 - 网页界面：`python hub.py serve --open`（http://127.0.0.1:8790）。
+- 用安装包安装后，命令写作 `hub <命令>`（等同于 `python hub.py <命令>`）。
